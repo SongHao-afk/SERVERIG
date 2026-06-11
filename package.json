@@ -1,0 +1,20 @@
+{
+  "name": "ig-downloader-mvp",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "cors": "^2.8.6",
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "nanoid": "^5.1.11",
+    "nodemailer": "^8.0.10",
+    "playwright": "^1.60.0"
+  }
+}
