@@ -1,6 +1,9 @@
+const MEDIA_TYPES = new Set(["p", "reel", "tv"]);
+
 function isInstagramUrl(url) {
   try {
     const u = new URL(url);
+
     return (
       u.hostname === "instagram.com" ||
       u.hostname === "www.instagram.com" ||
@@ -11,10 +14,15 @@ function isInstagramUrl(url) {
   }
 }
 
+function getPathParts(url) {
+  const u = new URL(url);
+  return u.pathname.split("/").filter(Boolean);
+}
+
 function isInstagramStoryUrl(url) {
   try {
-    const u = new URL(url);
-    const first = u.pathname.split("/").filter(Boolean)[0];
+    const parts = getPathParts(url);
+    const first = parts[0];
 
     return first === "stories" || first === "s";
   } catch {
@@ -24,8 +32,8 @@ function isInstagramStoryUrl(url) {
 
 function isInstagramHighlightStoryUrl(url) {
   try {
-    const u = new URL(url);
-    const first = u.pathname.split("/").filter(Boolean)[0];
+    const parts = getPathParts(url);
+    const first = parts[0];
 
     return first === "s";
   } catch {
@@ -35,18 +43,54 @@ function isInstagramHighlightStoryUrl(url) {
 
 function getInstagramShortcode(url) {
   try {
-    const u = new URL(url);
-    const parts = u.pathname.split("/").filter(Boolean);
-    const type = parts[0];
-    const code = parts[1];
+    const parts = getPathParts(url);
 
-    if (["p", "reel", "tv"].includes(type) && code) {
-      return code;
+    // Hỗ trợ:
+    // /p/CODE/
+    // /reel/CODE/
+    // /tv/CODE/
+    // /username/p/CODE/
+    // /username/reel/CODE/
+    // /username/tv/CODE/
+    for (let i = 0; i < parts.length - 1; i++) {
+      const type = parts[i];
+      const code = parts[i + 1];
+
+      if (MEDIA_TYPES.has(type) && code) {
+        return code;
+      }
     }
 
     return "";
   } catch {
     return "";
+  }
+}
+
+function normalizeInstagramMediaUrl(url) {
+  try {
+    if (!isInstagramUrl(url)) return String(url || "");
+
+    const u = new URL(url);
+    const parts = u.pathname.split("/").filter(Boolean);
+
+    // Giữ nguyên story/highlight vì route story khác post/reel.
+    if (parts[0] === "stories" || parts[0] === "s") {
+      return u.toString();
+    }
+
+    for (let i = 0; i < parts.length - 1; i++) {
+      const type = parts[i];
+      const code = parts[i + 1];
+
+      if (MEDIA_TYPES.has(type) && code) {
+        return `https://www.instagram.com/${type}/${code}/`;
+      }
+    }
+
+    return u.toString();
+  } catch {
+    return String(url || "");
   }
 }
 
@@ -119,7 +163,7 @@ function extractInstagramUsername(input) {
     "accounts",
     "direct",
     "about",
-    "developer"
+    "developer",
   ]);
 
   if (!username || blockedFirstSegments.has(username)) {
@@ -142,7 +186,8 @@ module.exports = {
   isInstagramStoryUrl,
   isInstagramHighlightStoryUrl,
   getInstagramShortcode,
+  normalizeInstagramMediaUrl,
   getInstagramStoryPk,
   extractInstagramUsername,
-  isAllowedInstagramMediaHost
+  isAllowedInstagramMediaHost,
 };

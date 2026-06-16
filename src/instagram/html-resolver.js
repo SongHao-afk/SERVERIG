@@ -3,8 +3,10 @@ const {
   isInstagramUrl,
   isInstagramStoryUrl,
   getInstagramShortcode,
-  getInstagramStoryPk
+  normalizeInstagramMediaUrl,
+  getInstagramStoryPk,
 } = require("../utils/ig-url");
+
 const { getInstagramContext, createPrivateCookieContext } = require("./context");
 const { checkInstagramSessionWithRetry } = require("./session");
 const { getSessionStatus } = require("./state");
@@ -16,7 +18,7 @@ async function resolveByHtml(page, igUrl, igCookie = "") {
 
   await page.goto(igUrl, {
     waitUntil: "domcontentloaded",
-    timeout: 60000
+    timeout: 60000,
   });
 
   await page.waitForTimeout(1200);
@@ -42,7 +44,7 @@ async function resolveByHtml(page, igUrl, igCookie = "") {
 
   await page.reload({
     waitUntil: "domcontentloaded",
-    timeout: 60000
+    timeout: 60000,
   });
 
   await page.waitForTimeout(1500);
@@ -61,10 +63,13 @@ async function extractInstagramMedia(igUrl, options = {}) {
     throw new Error("URL không phải Instagram");
   }
 
-  const isStory = isInstagramStoryUrl(igUrl);
+  const normalizedIgUrl = normalizeInstagramMediaUrl(igUrl);
+
+  const isStory = isInstagramStoryUrl(normalizedIgUrl);
+
   const mediaKey = isStory
-    ? getInstagramStoryPk(igUrl)
-    : getInstagramShortcode(igUrl);
+    ? getInstagramStoryPk(normalizedIgUrl)
+    : getInstagramShortcode(normalizedIgUrl);
 
   if (!mediaKey) {
     throw new Error("Không lấy được mã media từ URL Instagram");
@@ -82,11 +87,14 @@ async function extractInstagramMedia(igUrl, options = {}) {
       context = privateContextBundle.context;
     } else {
       if (!getSessionStatus().ok) {
-        const ok = await checkInstagramSessionWithRetry("resolve-auto-check", false);
+        const ok = await checkInstagramSessionWithRetry(
+          "resolve-auto-check",
+          false
+        );
 
         if (!ok) {
           throw new Error(
-            "Default Instagram session chưa đăng nhập hoặc đã hết hạn. Mở /setup-login để login lại."
+            "Default Instagram session chưa đăng nhập hoặc đã hết hạn.\nMở /setup-login để login lại."
           );
         }
       }
@@ -96,17 +104,17 @@ async function extractInstagramMedia(igUrl, options = {}) {
 
     page = await context.newPage();
 
-    const postMedia = await resolveByHtml(page, igUrl, igCookie);
+    const postMedia = await resolveByHtml(page, normalizedIgUrl, igCookie);
 
     const uniquePostMedia = [
-      ...new Map(postMedia.map(item => [item.downloadUrl, item])).values()
+      ...new Map(postMedia.map((item) => [item.downloadUrl, item])).values(),
     ];
 
     if (uniquePostMedia.length === 0) {
       throw new Error(
         privateMode
           ? "Không bắt được media. Có thể cookie private hết hạn hoặc account không có quyền xem link này."
-          : "Không bắt được media từ HTML Instagram. Có thể link private/expired hoặc default session không có quyền xem."
+          : "Không bắt được media từ HTML Instagram.\nCó thể link private/expired hoặc default session không có quyền xem."
       );
     }
 
@@ -118,26 +126,26 @@ async function extractInstagramMedia(igUrl, options = {}) {
       duration: item.duration || null,
       downloadUrl: item.downloadUrl,
       thumbnailUrl:
-        item.thumbnailUrl ||
-        (item.type === "image" ? item.downloadUrl : null)
+        item.thumbnailUrl || (item.type === "image" ? item.downloadUrl : null),
     }));
 
-    const type = media.some(x => x.type === "video")
+    const type = media.some((x) => x.type === "video")
       ? media.length > 1
         ? "carousel"
         : "video"
       : media.length > 1
-        ? "carousel"
-        : "image";
+      ? "carousel"
+      : "image";
 
     return {
       success: true,
       type,
       total: media.length,
       source: igUrl,
+      normalizedSource: normalizedIgUrl,
       mediaKey,
       mode: privateMode ? "private-client-cookie" : "public-default-session",
-      media
+      media,
     };
   } finally {
     if (page) {
@@ -152,5 +160,5 @@ async function extractInstagramMedia(igUrl, options = {}) {
 
 module.exports = {
   resolveByHtml,
-  extractInstagramMedia
+  extractInstagramMedia,
 };

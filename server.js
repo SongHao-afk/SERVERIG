@@ -9,6 +9,7 @@ const resolveRoutes = require("./src/routes/resolve.routes");
 const downloadRoutes = require("./src/routes/download.routes");
 const profileRoutes = require("./src/routes/profile.routes");
 
+const { HEADLESS } = require("./src/config");
 const { startInstagramSessionWatcher } = require("./src/instagram/session");
 const { closeDefaultInstagramContext } = require("./src/instagram/context");
 
@@ -25,7 +26,15 @@ app.use("/profile", profileRoutes);
 
 app.listen(3000, () => {
   console.log("🚀 Server chạy tại http://localhost:3000");
-  startInstagramSessionWatcher();
+
+  if (HEADLESS) {
+    console.log("🤖 HEADLESS=true → bật watcher check default Instagram session.");
+    startInstagramSessionWatcher();
+  } else {
+    console.log(
+      "🧑‍💻 HEADLESS=false → bỏ qua watcher để login Instagram thủ công qua /setup-login."
+    );
+  }
 });
 
 async function shutdown() {
