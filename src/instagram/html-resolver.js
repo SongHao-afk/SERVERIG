@@ -115,7 +115,7 @@ function shouldTryPublicNoLogin(normalizedIgUrl, isStory, privateMode) {
 
   const type = getMediaPathType(normalizedIgUrl);
 
-  return type === "reel";
+  return type === "reel" || type === "p";
 }
 
 function getStoryGroupParamsFromUrl(storyUrl) {
