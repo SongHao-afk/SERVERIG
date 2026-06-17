@@ -4,11 +4,114 @@ const { closeInstagramPopups } = require("./page");
 const PUBLIC_UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
+const PUBLIC_CACHE_TTL_MS = 5 * 60 * 1000;
+const PAGE_TIMEOUT_MS = 45000;
+const MAX_PUBLIC_CAROUSEL_STEPS = 20;
+
+let publicBrowser = null;
+let publicBrowserPromise = null;
+
+const publicCache = new Map();
+const inflightPublicResolve = new Map();
+
 function cleanUrl(value) {
   return String(value || "")
     .replaceAll("\\u0026", "&")
     .replaceAll("\\/", "/")
     .replaceAll("&amp;", "&");
+}
+
+function cloneMedia(items) {
+  return JSON.parse(JSON.stringify(items || []));
+}
+
+function getCache(key) {
+  const hit = publicCache.get(key);
+
+  if (!hit) return null;
+
+  if (Date.now() > hit.expiresAt) {
+    publicCache.delete(key);
+    return null;
+  }
+
+  return cloneMedia(hit.value);
+}
+
+function setCache(key, value, ttlMs = PUBLIC_CACHE_TTL_MS) {
+  if (!Array.isArray(value) || value.length === 0) return;
+
+  publicCache.set(key, {
+    value: cloneMedia(value),
+    expiresAt: Date.now() + ttlMs,
+  });
+}
+
+async function runOncePerKey(key, fn) {
+  if (inflightPublicResolve.has(key)) {
+    console.log(`⏳ PUBLIC WAIT SAME LINK | key=${key}`);
+    return await inflightPublicResolve.get(key);
+  }
+
+  const promise = fn().finally(() => {
+    inflightPublicResolve.delete(key);
+  });
+
+  inflightPublicResolve.set(key, promise);
+  return await promise;
+}
+
+async function getPublicBrowser() {
+  if (publicBrowser && publicBrowser.isConnected()) {
+    return publicBrowser;
+  }
+
+  if (!publicBrowserPromise) {
+    publicBrowserPromise = chromium
+      .launch({
+        headless: true,
+        args: [
+          "--no-sandbox",
+          "--disable-setuid-sandbox",
+          "--disable-dev-shm-usage",
+          "--disable-gpu",
+          "--disable-extensions",
+          "--disable-background-networking",
+          "--disable-sync",
+          "--metrics-recording-only",
+          "--mute-audio",
+        ],
+      })
+      .then((browser) => {
+        publicBrowser = browser;
+
+        browser.on("disconnected", () => {
+          publicBrowser = null;
+          publicBrowserPromise = null;
+          console.warn("⚠️ Public no-login browser disconnected");
+        });
+
+        console.log("✅ Public no-login browser ready");
+
+        return browser;
+      })
+      .catch((err) => {
+        publicBrowser = null;
+        publicBrowserPromise = null;
+        throw err;
+      });
+  }
+
+  return await publicBrowserPromise;
+}
+
+async function closePublicBrowser() {
+  if (publicBrowser) {
+    await publicBrowser.close().catch(() => {});
+  }
+
+  publicBrowser = null;
+  publicBrowserPromise = null;
 }
 
 function getMediaPathType(igUrl) {
@@ -53,10 +156,6 @@ function isBadProfileImageUrl(url) {
     url.includes("/v/t51.82787-19/") ||
     url.includes("/v/t51.12442-15/")
   );
-}
-
-function uniqueNonEmpty(list) {
-  return [...new Set(list.map(cleanUrl).filter(Boolean))];
 }
 
 function pickRecentVideo(responseMedia, afterTime = 0) {
@@ -122,9 +221,37 @@ async function closeGuestPopups(page) {
 }
 
 async function waitPageReady(page) {
-  await page.waitForTimeout(1800);
+  await Promise.race([
+    page.waitForSelector("article, main, video, img", { timeout: 1200 }).catch(() => null),
+    page.waitForTimeout(1200),
+  ]);
+
+  await page.waitForTimeout(500);
   await closeGuestPopups(page);
-  await page.waitForTimeout(800);
+  await page.waitForTimeout(250);
+}
+
+async function installFastRouteBlocker(page) {
+  await page
+    .route("**/*", async (route) => {
+      const req = route.request();
+      const type = req.resourceType();
+      const url = req.url();
+
+      const shouldBlock =
+        type === "font" ||
+        url.includes("google-analytics") ||
+        url.includes("googletagmanager") ||
+        url.includes("doubleclick") ||
+        url.includes("facebook.com/tr");
+
+      if (shouldBlock) {
+        return route.abort().catch(() => {});
+      }
+
+      return route.continue().catch(() => {});
+    })
+    .catch(() => {});
 }
 
 async function tryStartVideo(page) {
@@ -302,7 +429,7 @@ async function getVisiblePostMedia(page) {
 }
 
 async function clickNextCarousel(page) {
-  const clickedByButton = await page
+  return await page
     .evaluate(() => {
       function isVisible(el) {
         const rect = el.getBoundingClientRect();
@@ -344,16 +471,41 @@ async function clickNextCarousel(page) {
         return true;
       }
 
+      const vw = window.innerWidth || document.documentElement.clientWidth || 0;
+      const vh = window.innerHeight || document.documentElement.clientHeight || 0;
+
+      const rightButtons = buttons
+        .map((btn) => {
+          const rect = btn.getBoundingClientRect();
+
+          return {
+            btn,
+            rect,
+            visible: isVisible(btn),
+          };
+        })
+        .filter((x) => {
+          const rect = x.rect;
+
+          return (
+            x.visible &&
+            rect.left > vw * 0.55 &&
+            rect.top > vh * 0.15 &&
+            rect.bottom < vh * 0.95 &&
+            rect.width <= 90 &&
+            rect.height <= 90
+          );
+        })
+        .sort((a, b) => b.rect.right - a.rect.right);
+
+      if (rightButtons.length > 0) {
+        rightButtons[0].btn.click();
+        return true;
+      }
+
       return false;
     })
     .catch(() => false);
-
-  if (clickedByButton) {
-    return true;
-  }
-
-  await page.keyboard.press("ArrowRight").catch(() => {});
-  return true;
 }
 
 function normalizePublicItem(item, responseMedia, afterTime) {
@@ -407,57 +559,41 @@ function normalizePublicItem(item, responseMedia, afterTime) {
 async function resolvePublicPostByDom(page, igUrl, responseMedia) {
   await page.goto(igUrl, {
     waitUntil: "domcontentloaded",
-    timeout: 60000,
+    timeout: PAGE_TIMEOUT_MS,
   });
 
   await waitPageReady(page);
 
   const media = [];
   const seen = new Set();
-  let missCount = 0;
+  let staleCount = 0;
 
-  for (let i = 0; i < 15; i++) {
+  for (let i = 0; i < MAX_PUBLIC_CAROUSEL_STEPS; i++) {
     const startedAt = Date.now();
 
     await tryStartVideo(page);
-    await page.waitForTimeout(500);
+    await page.waitForTimeout(250);
 
     const visible = await getVisiblePostMedia(page);
-    const item = normalizePublicItem(visible, responseMedia, startedAt - 3000);
+    const item = normalizePublicItem(visible, responseMedia, startedAt - 2500);
 
     if (item && item.downloadUrl && !seen.has(item.downloadUrl)) {
       seen.add(item.downloadUrl);
       media.push(item);
-      missCount = 0;
+      staleCount = 0;
     } else {
-      missCount++;
+      staleCount++;
     }
 
-    const beforeCount = media.length;
+    const clicked = await clickNextCarousel(page);
 
-    await clickNextCarousel(page);
-    await page.waitForTimeout(1000);
-
-    const afterVisible = await getVisiblePostMedia(page);
-    const afterItem = normalizePublicItem(
-      afterVisible,
-      responseMedia,
-      startedAt - 3000
-    );
-
-    if (
-      afterItem &&
-      afterItem.downloadUrl &&
-      !seen.has(afterItem.downloadUrl)
-    ) {
-      seen.add(afterItem.downloadUrl);
-      media.push(afterItem);
-      missCount = 0;
-    } else if (media.length === beforeCount) {
-      missCount++;
+    if (!clicked) {
+      break;
     }
 
-    if (missCount >= 2) {
+    await page.waitForTimeout(550);
+
+    if (staleCount >= 3) {
       break;
     }
   }
@@ -468,7 +604,7 @@ async function resolvePublicPostByDom(page, igUrl, responseMedia) {
 async function resolvePublicReelByDom(page, igUrl, responseMedia) {
   await page.goto(igUrl, {
     waitUntil: "domcontentloaded",
-    timeout: 60000,
+    timeout: PAGE_TIMEOUT_MS,
   });
 
   await waitPageReady(page);
@@ -476,17 +612,17 @@ async function resolvePublicReelByDom(page, igUrl, responseMedia) {
   const startedAt = Date.now();
 
   await tryStartVideo(page);
-  await page.waitForTimeout(2500);
+  await page.waitForTimeout(1200);
 
   const visible = await getVisiblePostMedia(page);
-  const item = normalizePublicItem(visible, responseMedia, startedAt - 3000);
+  const item = normalizePublicItem(visible, responseMedia, startedAt - 2500);
 
   if (item && item.type === "video" && item.downloadUrl) {
     return [item];
   }
 
-  const videoUrl = pickRecentVideo(responseMedia, startedAt - 3000);
-  const posterUrl = pickRecentImage(responseMedia, startedAt - 3000);
+  const videoUrl = pickRecentVideo(responseMedia, startedAt - 2500);
+  const posterUrl = pickRecentImage(responseMedia, startedAt - 2500);
 
   if (!videoUrl) {
     return [];
@@ -504,24 +640,16 @@ async function resolvePublicReelByDom(page, igUrl, responseMedia) {
   ];
 }
 
-async function resolvePublicMedia(igUrl) {
-  let browser = null;
+async function resolvePublicMediaFresh(igUrl) {
   let context = null;
   let page = null;
 
   const pathType = getMediaPathType(igUrl);
   const responseMedia = [];
 
-  try {
-    browser = await chromium.launch({
-      headless: true,
-      args: [
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage",
-      ],
-    });
+  const browser = await getPublicBrowser();
 
+  try {
     context = await browser.newContext({
       userAgent: PUBLIC_UA,
       locale: "vi-VN",
@@ -532,6 +660,8 @@ async function resolvePublicMedia(igUrl) {
     });
 
     page = await context.newPage();
+
+    await installFastRouteBlocker(page);
 
     page.on("response", async (res) => {
       try {
@@ -575,13 +705,39 @@ async function resolvePublicMedia(igUrl) {
     if (context) {
       await context.close().catch(() => {});
     }
-
-    if (browser) {
-      await browser.close().catch(() => {});
-    }
   }
+}
+
+async function resolvePublicMedia(igUrl) {
+  const cacheKey = cleanUrl(igUrl);
+  const cached = getCache(cacheKey);
+
+  if (cached) {
+    console.log(`⚡ PUBLIC CACHE HIT | key=${getMediaPathType(igUrl)} | total=${cached.length}`);
+    return cached;
+  }
+
+  return await runOncePerKey(cacheKey, async () => {
+    const cachedAgain = getCache(cacheKey);
+
+    if (cachedAgain) {
+      console.log(
+        `⚡ PUBLIC CACHE HIT | key=${getMediaPathType(igUrl)} | total=${cachedAgain.length}`
+      );
+      return cachedAgain;
+    }
+
+    const media = await resolvePublicMediaFresh(igUrl);
+
+    if (media.length > 0) {
+      setCache(cacheKey, media);
+    }
+
+    return media;
+  });
 }
 
 module.exports = {
   resolvePublicMedia,
+  closePublicBrowser,
 };
