@@ -155,6 +155,40 @@ function getStoryGroupParamsFromUrl(storyUrl) {
   throw new Error("URL story group không hợp lệ");
 }
 
+function getStoryGroupResponseType(media) {
+  if (!media.length) return "image";
+
+  if (media.length > 1) {
+    return "carousel";
+  }
+
+  return media[0].type || "image";
+}
+
+function normalizeStoryGroupItem(item, index) {
+  const type = item.type || "image";
+
+  return {
+    id: index + 1,
+    storyId: item.id || item.pk || null,
+    index: index + 1,
+    type,
+    width: item.width || null,
+    height: item.height || null,
+    duration: item.duration || null,
+    downloadUrl: item.downloadUrl,
+    thumbnailUrl:
+      item.thumbnailUrl ||
+      (type === "image" ? item.downloadUrl : null),
+    sourceUrl: item.sourceUrl || null,
+    takenAt: item.takenAt || item.taken_at || null,
+    mediaType: item.mediaType || item.media_type || null,
+  };
+}
+
+// Giữ tên cũ để khỏi phải sửa route/import khác.
+// Trước đây hàm này chỉ trả story đầu tiên.
+// Bây giờ nó trả TOÀN BỘ story items load được trong group/highlight.
 async function extractFirstStoryMedia(igUrl, options = {}) {
   const igCookie = normalizeIgCookie(options.igCookie || "");
   const privateMode = Boolean(igCookie);
@@ -189,47 +223,47 @@ async function extractFirstStoryMedia(igUrl, options = {}) {
     }
   );
 
-  const firstItem = Array.isArray(storyData.items) ? storyData.items[0] : null;
+  const rawItems = Array.isArray(storyData.items) ? storyData.items : [];
 
-  if (!firstItem || !firstItem.downloadUrl) {
+  const validItems = rawItems.filter((item) => {
+    return item && item.downloadUrl;
+  });
+
+  if (!validItems.length) {
     throw new Error(
-      "Không bắt được media story đầu tiên. Có thể story đã hết hạn, account không có quyền xem, hoặc session Instagram hết hạn."
+      "Không bắt được media story trong group/highlight. Có thể story đã hết hạn, account không có quyền xem, hoặc session Instagram hết hạn."
     );
   }
 
-  const media = [
-    {
-      id: 1,
-      type: firstItem.type || "image",
-      width: firstItem.width || null,
-      height: firstItem.height || null,
-      duration: firstItem.duration || null,
-      downloadUrl: firstItem.downloadUrl,
-      thumbnailUrl:
-        firstItem.thumbnailUrl ||
-        (firstItem.type === "image" ? firstItem.downloadUrl : null),
-    },
-  ];
+  const media = validItems.map((item, index) =>
+    normalizeStoryGroupItem(item, index)
+  );
+
+  const responseType = getStoryGroupResponseType(media);
 
   const mediaKey =
-    firstItem.id ||
     getInstagramStoryGroupKey(normalizedIgUrl) ||
     getInstagramStoryUsername(normalizedIgUrl) ||
-    "story-first";
+    params.groupId ||
+    "story-group";
 
   logResolveOk({
     mode,
     kind: "STORY_GROUP",
     engine: storyData.mode || "story-profile-api",
-    type: media[0].type,
-    total: 1,
+    type: responseType,
+    total: media.length,
     mediaKey,
   });
 
   return {
     success: true,
-    type: media[0].type,
-    total: 1,
+    type: responseType,
+    total: media.length,
+    totalAvailable: rawItems.length,
+    limit: "all",
+    kind: params.kind,
+    groupId: params.groupId,
     source: igUrl,
     normalizedSource: normalizedIgUrl,
     mediaKey,
