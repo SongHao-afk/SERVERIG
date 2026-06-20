@@ -41,6 +41,28 @@ function pickBestCandidate(candidates) {
   return cleanUrl(sorted[0]?.url);
 }
 
+function pickBestVideoVersion(media) {
+  const versions = Array.isArray(media?.video_versions)
+    ? media.video_versions
+    : [];
+
+  if (versions.length === 0) {
+    return null;
+  }
+
+  return [...versions].sort((a, b) => {
+    const aw = Number(a?.width || 0);
+    const ah = Number(a?.height || 0);
+    const bw = Number(b?.width || 0);
+    const bh = Number(b?.height || 0);
+
+    const aScore = aw * ah || aw;
+    const bScore = bw * bh || bw;
+
+    return bScore - aScore;
+  })[0];
+}
+
 function getApiImageUrl(media) {
   return (
     pickBestCandidate(media?.image_versions2?.candidates) ||
@@ -62,10 +84,12 @@ function getApiShortcode(media) {
     media?.code ||
       media?.shortcode ||
       media?.media_code ||
-      media?.pk ||
-      media?.id ||
       ""
   );
+}
+
+function getApiId(media, fallback = null) {
+  return String(media?.pk || media?.id || media?.code || media?.shortcode || fallback || "");
 }
 
 function normalizeProductType(media) {
@@ -122,17 +146,29 @@ function normalizePostApiMedia(media, index) {
 
 function normalizeReelApiMedia(media, index) {
   const shortcode = getApiShortcode(media);
+  const coverUrl = getApiImageUrl(media);
+  const bestVideo = pickBestVideoVersion(media);
+  const downloadUrl = cleanUrl(bestVideo?.url || bestVideo?.src);
 
-  if (!shortcode) return null;
+  // Reel có video_versions thì trả thẳng downloadUrl.
+  // Nếu thiếu downloadUrl nhưng có shortcode thì vẫn giữ fallback cho /profile/media-items.
+  if (!downloadUrl && !shortcode) return null;
 
   return {
-    id: shortcode,
+    id: shortcode || getApiId(media, index),
     index,
     kind: "reel",
     type: "video",
-    shortcode,
-    url: `https://www.instagram.com/reel/${shortcode}/`,
-    coverUrl: getApiImageUrl(media),
+    shortcode: shortcode || null,
+    url: shortcode ? `https://www.instagram.com/reel/${shortcode}/` : null,
+    coverUrl,
+    thumbnailUrl: coverUrl,
+    downloadUrl,
+    canDownload: Boolean(downloadUrl),
+    needsResolve: !downloadUrl && Boolean(shortcode),
+    width: Number(bestVideo?.width || media?.original_width || 0) || null,
+    height: Number(bestVideo?.height || media?.original_height || 0) || null,
+    duration: Number(media?.video_duration || media?.duration || 0) || null,
     caption: getApiCaption(media),
     takenAt: media?.taken_at || media?.taken_at_timestamp || null,
     itemCount: 1,

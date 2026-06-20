@@ -21,6 +21,10 @@ function cleanUrl(value) {
     .replaceAll("&amp;", "&");
 }
 
+function cleanText(value) {
+  return String(value || "").replace(/\s+/g, " ").trim();
+}
+
 function cloneMedia(items) {
   return JSON.parse(JSON.stringify(items || []));
 }
@@ -125,6 +129,26 @@ function getMediaPathType(igUrl) {
   }
 }
 
+function getShortcodeFromUrl(igUrl) {
+  try {
+    const u = new URL(igUrl);
+    const parts = u.pathname.split("/").filter(Boolean);
+    const type = parts[0];
+
+    if ((type === "p" || type === "reel" || type === "reels" || type === "tv") && parts[1]) {
+      return parts[1];
+    }
+
+    if (parts.length >= 3 && (parts[1] === "reel" || parts[1] === "reels" || parts[1] === "p")) {
+      return parts[2];
+    }
+
+    return "";
+  } catch {
+    return "";
+  }
+}
+
 function isInstagramCdn(url) {
   return (
     url.includes("cdninstagram.com") ||
@@ -156,6 +180,320 @@ function isBadProfileImageUrl(url) {
     url.includes("/v/t51.82787-19/") ||
     url.includes("/v/t51.12442-15/")
   );
+}
+
+function normalizeProfile(profile = {}) {
+  return {
+    username: cleanText(profile.username || ""),
+    fullName: cleanText(profile.fullName || profile.full_name || ""),
+    avatarUrl: cleanUrl(
+      profile.avatarUrl ||
+        profile.profilePicUrl ||
+        profile.profile_pic_url ||
+        ""
+    ),
+  };
+}
+
+function withPublicMetadata(item, profile, igUrl) {
+  const p = normalizeProfile(profile);
+  const sourceUrl = cleanUrl(igUrl);
+  const shortcode = getShortcodeFromUrl(igUrl);
+
+  return {
+    ...item,
+    sourceUrl,
+    shortcode,
+    username: cleanText(item.username || p.username),
+    fullName: cleanText(item.fullName || item.full_name || p.fullName),
+    avatarUrl: cleanUrl(
+      item.avatarUrl ||
+        item.profilePicUrl ||
+        item.profile_pic_url ||
+        p.avatarUrl
+    ),
+  };
+}
+
+async function extractPublicProfileInfo(page) {
+  try {
+    return await page.evaluate(() => {
+      const RESERVED_PATHS = new Set([
+        "p",
+        "reel",
+        "reels",
+        "tv",
+        "stories",
+        "explore",
+        "accounts",
+        "direct",
+        "challenge",
+        "about",
+        "developer",
+        "legal",
+        "privacy",
+        "terms",
+        "api",
+        "oauth",
+      ]);
+
+      function cleanText(value) {
+        return String(value || "").replace(/\s+/g, " ").trim();
+      }
+
+      function cleanUrl(value) {
+        return String(value || "")
+          .replaceAll("\\u0026", "&")
+          .replaceAll("\\/", "/")
+          .replaceAll("&amp;", "&");
+      }
+
+      function escapeRegExp(value) {
+        return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      }
+
+      function getMeta(selector) {
+        const el = document.querySelector(selector);
+        return cleanText(el?.getAttribute("content") || "");
+      }
+
+      function isGoodUsername(value) {
+        const clean = cleanText(value).replace(/^@/, "");
+
+        if (!clean) return false;
+        if (RESERVED_PATHS.has(clean.toLowerCase())) return false;
+
+        return /^[A-Za-z0-9._]{2,30}$/.test(clean);
+      }
+
+      function getRoot() {
+        return (
+          document.querySelector("article") ||
+          document.querySelector("main") ||
+          document.body
+        );
+      }
+
+      function getUsernameFromLinks() {
+        const root = getRoot();
+        const anchors = [...root.querySelectorAll('a[href^="/"]')];
+
+        for (const a of anchors) {
+          try {
+            const href = a.getAttribute("href") || "";
+            const url = new URL(href, location.origin);
+            const parts = url.pathname.split("/").filter(Boolean);
+
+            if (parts.length !== 1) continue;
+
+            const candidate = parts[0];
+
+            if (isGoodUsername(candidate)) {
+              return candidate;
+            }
+          } catch {}
+        }
+
+        return "";
+      }
+
+      function getScriptText() {
+        return [...document.scripts]
+          .map((script) => script.textContent || "")
+          .filter(Boolean)
+          .join("\n");
+      }
+
+      function findJsonValue(patterns) {
+        const text = getScriptText();
+
+        for (const pattern of patterns) {
+          const match = text.match(pattern);
+
+          if (match && match[1]) {
+            return cleanUrl(match[1]);
+          }
+        }
+
+        return "";
+      }
+
+      function getUsernameFromMeta() {
+        const candidates = [
+          document.title,
+          getMeta('meta[property="og:title"]'),
+          getMeta('meta[name="description"]'),
+          getMeta('meta[property="og:description"]'),
+        ].join(" ");
+
+        let match = candidates.match(/@([A-Za-z0-9._]{2,30})/);
+
+        if (match && isGoodUsername(match[1])) {
+          return match[1];
+        }
+
+        match = candidates.match(/^([A-Za-z0-9._]{2,30})\s+on Instagram/i);
+
+        if (match && isGoodUsername(match[1])) {
+          return match[1];
+        }
+
+        return "";
+      }
+
+      function getUsernameFromJson() {
+        return findJsonValue([
+          /"owner"\s*:\s*\{[\s\S]{0,1200}?"username"\s*:\s*"([^"]+)"/,
+          /"user"\s*:\s*\{[\s\S]{0,1200}?"username"\s*:\s*"([^"]+)"/,
+          /"ownerUsername"\s*:\s*"([^"]+)"/,
+          /"owner_username"\s*:\s*"([^"]+)"/,
+          /"username"\s*:\s*"([^"]+)"/,
+          /"alternateName"\s*:\s*"@?([^"]+)"/,
+        ]);
+      }
+
+      function getFullNameFromMeta() {
+        const ogTitle =
+          getMeta('meta[property="og:title"]') || cleanText(document.title);
+
+        const match = ogTitle.match(/^(.+?)\s+on Instagram/i);
+
+        if (match && match[1]) {
+          return cleanText(match[1].replace(/^@/, ""));
+        }
+
+        return "";
+      }
+
+      function getFullNameFromJson() {
+        return findJsonValue([
+          /"owner"\s*:\s*\{[\s\S]{0,1600}?"full_name"\s*:\s*"([^"]+)"/,
+          /"user"\s*:\s*\{[\s\S]{0,1600}?"full_name"\s*:\s*"([^"]+)"/,
+          /"full_name"\s*:\s*"([^"]+)"/,
+          /"fullName"\s*:\s*"([^"]+)"/,
+          /"name"\s*:\s*"([^"]+)"/,
+        ]);
+      }
+
+      function getAvatarFromOwnerLink(username) {
+        const cleanUsername = cleanText(username).replace(/^@/, "");
+
+        if (!cleanUsername) return "";
+
+        const root = getRoot();
+
+        const links = [
+          ...root.querySelectorAll(`a[href="/${cleanUsername}/"]`),
+          ...root.querySelectorAll(`a[href="/${cleanUsername}"]`),
+        ];
+
+        for (const link of links) {
+          const candidates = [
+            link.querySelector("img"),
+            link.closest("header")?.querySelector("img"),
+            link.closest("article")?.querySelector(
+              `a[href="/${cleanUsername}/"] img, a[href="/${cleanUsername}"] img`
+            ),
+          ].filter(Boolean);
+
+          for (const img of candidates) {
+            const src = cleanUrl(img.currentSrc || img.src || "");
+
+            if (!src) continue;
+            if (src.startsWith("blob:")) continue;
+
+            const isCdn =
+              src.includes("cdninstagram.com") ||
+              src.includes("fbcdn.net") ||
+              src.includes("scontent");
+
+            if (!isCdn) continue;
+
+            return src;
+          }
+        }
+
+        return "";
+      }
+
+      function getAvatarFromJsonNearUsername(username) {
+        const cleanUsername = cleanText(username).replace(/^@/, "");
+
+        if (!cleanUsername) return "";
+
+        const text = getScriptText();
+        const u = escapeRegExp(cleanUsername);
+
+        const patterns = [
+          new RegExp(
+            `"owner"\\s*:\\s*\\{[\\s\\S]{0,2200}?"username"\\s*:\\s*"${u}"[\\s\\S]{0,2200}?"profile_pic_url_hd"\\s*:\\s*"([^"]+)"`,
+            "i"
+          ),
+          new RegExp(
+            `"owner"\\s*:\\s*\\{[\\s\\S]{0,2200}?"username"\\s*:\\s*"${u}"[\\s\\S]{0,2200}?"profile_pic_url"\\s*:\\s*"([^"]+)"`,
+            "i"
+          ),
+          new RegExp(
+            `"user"\\s*:\\s*\\{[\\s\\S]{0,2200}?"username"\\s*:\\s*"${u}"[\\s\\S]{0,2200}?"profile_pic_url_hd"\\s*:\\s*"([^"]+)"`,
+            "i"
+          ),
+          new RegExp(
+            `"user"\\s*:\\s*\\{[\\s\\S]{0,2200}?"username"\\s*:\\s*"${u}"[\\s\\S]{0,2200}?"profile_pic_url"\\s*:\\s*"([^"]+)"`,
+            "i"
+          ),
+          new RegExp(
+            `"username"\\s*:\\s*"${u}"[\\s\\S]{0,2600}?"profile_pic_url_hd"\\s*:\\s*"([^"]+)"`,
+            "i"
+          ),
+          new RegExp(
+            `"username"\\s*:\\s*"${u}"[\\s\\S]{0,2600}?"profile_pic_url"\\s*:\\s*"([^"]+)"`,
+            "i"
+          ),
+          new RegExp(
+            `"profile_pic_url_hd"\\s*:\\s*"([^"]+)"[\\s\\S]{0,2600}?"username"\\s*:\\s*"${u}"`,
+            "i"
+          ),
+          new RegExp(
+            `"profile_pic_url"\\s*:\\s*"([^"]+)"[\\s\\S]{0,2600}?"username"\\s*:\\s*"${u}"`,
+            "i"
+          ),
+        ];
+
+        for (const pattern of patterns) {
+          const match = text.match(pattern);
+
+          if (match && match[1]) {
+            return cleanUrl(match[1]);
+          }
+        }
+
+        return "";
+      }
+
+      const username = cleanText(
+        getUsernameFromJson() || getUsernameFromLinks() || getUsernameFromMeta()
+      ).replace(/^@/, "");
+
+      const fullName = cleanText(getFullNameFromJson() || getFullNameFromMeta());
+
+      const avatarUrl = cleanUrl(
+        getAvatarFromOwnerLink(username) ||
+          getAvatarFromJsonNearUsername(username)
+      );
+
+      return {
+        username,
+        fullName,
+        avatarUrl,
+      };
+    });
+  } catch {
+    return {
+      username: "",
+      fullName: "",
+      avatarUrl: "",
+    };
+  }
 }
 
 function pickRecentVideo(responseMedia, afterTime = 0) {
@@ -222,7 +560,9 @@ async function closeGuestPopups(page) {
 
 async function waitPageReady(page) {
   await Promise.race([
-    page.waitForSelector("article, main, video, img", { timeout: 1200 }).catch(() => null),
+    page
+      .waitForSelector("article, main, video, img", { timeout: 1200 })
+      .catch(() => null),
     page.waitForTimeout(1200),
   ]);
 
@@ -564,6 +904,8 @@ async function resolvePublicPostByDom(page, igUrl, responseMedia) {
 
   await waitPageReady(page);
 
+  const profile = await extractPublicProfileInfo(page);
+
   const media = [];
   const seen = new Set();
   let staleCount = 0;
@@ -579,7 +921,7 @@ async function resolvePublicPostByDom(page, igUrl, responseMedia) {
 
     if (item && item.downloadUrl && !seen.has(item.downloadUrl)) {
       seen.add(item.downloadUrl);
-      media.push(item);
+      media.push(withPublicMetadata(item, profile, igUrl));
       staleCount = 0;
     } else {
       staleCount++;
@@ -609,6 +951,8 @@ async function resolvePublicReelByDom(page, igUrl, responseMedia) {
 
   await waitPageReady(page);
 
+  const profile = await extractPublicProfileInfo(page);
+
   const startedAt = Date.now();
 
   await tryStartVideo(page);
@@ -618,7 +962,7 @@ async function resolvePublicReelByDom(page, igUrl, responseMedia) {
   const item = normalizePublicItem(visible, responseMedia, startedAt - 2500);
 
   if (item && item.type === "video" && item.downloadUrl) {
-    return [item];
+    return [withPublicMetadata(item, profile, igUrl)];
   }
 
   const videoUrl = pickRecentVideo(responseMedia, startedAt - 2500);
@@ -629,14 +973,18 @@ async function resolvePublicReelByDom(page, igUrl, responseMedia) {
   }
 
   return [
-    {
-      type: "video",
-      width: null,
-      height: null,
-      duration: null,
-      downloadUrl: videoUrl,
-      thumbnailUrl: posterUrl || null,
-    },
+    withPublicMetadata(
+      {
+        type: "video",
+        width: null,
+        height: null,
+        duration: null,
+        downloadUrl: videoUrl,
+        thumbnailUrl: posterUrl || null,
+      },
+      profile,
+      igUrl
+    ),
   ];
 }
 
@@ -692,7 +1040,7 @@ async function resolvePublicMediaFresh(igUrl) {
       return await resolvePublicPostByDom(page, igUrl, responseMedia);
     }
 
-    if (pathType === "reel") {
+    if (pathType === "reel" || pathType === "reels") {
       return await resolvePublicReelByDom(page, igUrl, responseMedia);
     }
 
@@ -713,7 +1061,9 @@ async function resolvePublicMedia(igUrl) {
   const cached = getCache(cacheKey);
 
   if (cached) {
-    console.log(`⚡ PUBLIC CACHE HIT | key=${getMediaPathType(igUrl)} | total=${cached.length}`);
+    console.log(
+      `⚡ PUBLIC CACHE HIT | key=${getMediaPathType(igUrl)} | total=${cached.length}`
+    );
     return cached;
   }
 

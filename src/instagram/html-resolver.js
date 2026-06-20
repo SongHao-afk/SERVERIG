@@ -25,6 +25,362 @@ try {
   resolvePublicMedia = null;
 }
 
+function cleanUrl(value) {
+  return String(value || "")
+    .replaceAll("\\u0026", "&")
+    .replaceAll("\\/", "/")
+    .replaceAll("&amp;", "&");
+}
+
+function cleanText(value) {
+  return String(value || "").replace(/\s+/g, " ").trim();
+}
+
+function firstNonEmpty(values) {
+  for (const value of values) {
+    const clean = cleanText(value);
+
+    if (clean) {
+      return clean;
+    }
+  }
+
+  return "";
+}
+
+function normalizeProfile(profile = {}) {
+  return {
+    username: cleanText(profile.username || profile.ownerUsername || ""),
+    fullName: cleanText(profile.fullName || profile.full_name || ""),
+    avatarUrl: cleanUrl(
+      profile.avatarUrl ||
+        profile.profilePicUrl ||
+        profile.profile_pic_url ||
+        profile.ownerAvatarUrl ||
+        ""
+    ),
+  };
+}
+
+function mergeProfile(...profiles) {
+  const normalized = profiles.map((x) => normalizeProfile(x || {}));
+
+  return {
+    username: firstNonEmpty(normalized.map((x) => x.username)),
+    fullName: firstNonEmpty(normalized.map((x) => x.fullName)),
+    avatarUrl: firstNonEmpty(normalized.map((x) => x.avatarUrl)),
+  };
+}
+
+function getProfileFromItems(items) {
+  if (!Array.isArray(items)) {
+    return normalizeProfile();
+  }
+
+  const found = items.find((item) => {
+    return (
+      item &&
+      (item.username ||
+        item.fullName ||
+        item.full_name ||
+        item.avatarUrl ||
+        item.profilePicUrl ||
+        item.profile_pic_url)
+    );
+  });
+
+  return normalizeProfile(found || {});
+}
+
+function attachProfileToMedia(media, profile) {
+  if (Array.isArray(media)) {
+    media.profile = normalizeProfile(profile);
+  }
+
+  return media;
+}
+
+async function extractPageProfileInfo(page) {
+  try {
+    return await page.evaluate(() => {
+      const RESERVED_PATHS = new Set([
+        "p",
+        "reel",
+        "reels",
+        "tv",
+        "stories",
+        "explore",
+        "accounts",
+        "direct",
+        "challenge",
+        "about",
+        "developer",
+        "legal",
+        "privacy",
+        "terms",
+        "api",
+        "oauth",
+      ]);
+
+      function cleanText(value) {
+        return String(value || "").replace(/\s+/g, " ").trim();
+      }
+
+      function cleanUrl(value) {
+        return String(value || "")
+          .replaceAll("\\u0026", "&")
+          .replaceAll("\\/", "/")
+          .replaceAll("&amp;", "&");
+      }
+
+      function escapeRegExp(value) {
+        return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      }
+
+      function getMeta(selector) {
+        const el = document.querySelector(selector);
+        return cleanText(el?.getAttribute("content") || "");
+      }
+
+      function isGoodUsername(value) {
+        const clean = cleanText(value).replace(/^@/, "");
+
+        if (!clean) return false;
+        if (RESERVED_PATHS.has(clean.toLowerCase())) return false;
+
+        return /^[A-Za-z0-9._]{2,30}$/.test(clean);
+      }
+
+      function getRoot() {
+        return (
+          document.querySelector("article") ||
+          document.querySelector("main") ||
+          document.body
+        );
+      }
+
+      function getUsernameFromLinks() {
+        const root = getRoot();
+        const anchors = [...root.querySelectorAll('a[href^="/"]')];
+
+        for (const a of anchors) {
+          try {
+            const href = a.getAttribute("href") || "";
+            const url = new URL(href, location.origin);
+            const parts = url.pathname.split("/").filter(Boolean);
+
+            if (parts.length !== 1) continue;
+
+            const candidate = parts[0];
+
+            if (isGoodUsername(candidate)) {
+              return candidate;
+            }
+          } catch {}
+        }
+
+        return "";
+      }
+
+      function getScriptText() {
+        return [...document.scripts]
+          .map((script) => script.textContent || "")
+          .filter(Boolean)
+          .join("\n");
+      }
+
+      function findJsonValue(patterns) {
+        const text = getScriptText();
+
+        for (const pattern of patterns) {
+          const match = text.match(pattern);
+
+          if (match && match[1]) {
+            return cleanUrl(match[1]);
+          }
+        }
+
+        return "";
+      }
+
+      function getUsernameFromMeta() {
+        const candidates = [
+          document.title,
+          getMeta('meta[property="og:title"]'),
+          getMeta('meta[name="description"]'),
+          getMeta('meta[property="og:description"]'),
+        ].join(" ");
+
+        let match = candidates.match(/@([A-Za-z0-9._]{2,30})/);
+
+        if (match && isGoodUsername(match[1])) {
+          return match[1];
+        }
+
+        match = candidates.match(/^([A-Za-z0-9._]{2,30})\s+on Instagram/i);
+
+        if (match && isGoodUsername(match[1])) {
+          return match[1];
+        }
+
+        return "";
+      }
+
+      function getUsernameFromJson() {
+        return findJsonValue([
+          /"owner"\s*:\s*\{[\s\S]{0,1200}?"username"\s*:\s*"([^"]+)"/,
+          /"user"\s*:\s*\{[\s\S]{0,1200}?"username"\s*:\s*"([^"]+)"/,
+          /"ownerUsername"\s*:\s*"([^"]+)"/,
+          /"owner_username"\s*:\s*"([^"]+)"/,
+          /"username"\s*:\s*"([^"]+)"/,
+          /"alternateName"\s*:\s*"@?([^"]+)"/,
+        ]);
+      }
+
+      function getFullNameFromMeta() {
+        const ogTitle =
+          getMeta('meta[property="og:title"]') || cleanText(document.title);
+
+        const match = ogTitle.match(/^(.+?)\s+on Instagram/i);
+
+        if (match && match[1]) {
+          return cleanText(match[1].replace(/^@/, ""));
+        }
+
+        return "";
+      }
+
+      function getFullNameFromJson() {
+        return findJsonValue([
+          /"owner"\s*:\s*\{[\s\S]{0,1600}?"full_name"\s*:\s*"([^"]+)"/,
+          /"user"\s*:\s*\{[\s\S]{0,1600}?"full_name"\s*:\s*"([^"]+)"/,
+          /"full_name"\s*:\s*"([^"]+)"/,
+          /"fullName"\s*:\s*"([^"]+)"/,
+          /"name"\s*:\s*"([^"]+)"/,
+        ]);
+      }
+
+      function getAvatarFromOwnerLink(username) {
+        const cleanUsername = cleanText(username).replace(/^@/, "");
+
+        if (!cleanUsername) return "";
+
+        const root = getRoot();
+
+        const links = [
+          ...root.querySelectorAll(`a[href="/${cleanUsername}/"]`),
+          ...root.querySelectorAll(`a[href="/${cleanUsername}"]`),
+        ];
+
+        for (const link of links) {
+          const candidates = [
+            link.querySelector("img"),
+            link.closest("header")?.querySelector("img"),
+            link.closest("article")?.querySelector(
+              `a[href="/${cleanUsername}/"] img, a[href="/${cleanUsername}"] img`
+            ),
+          ].filter(Boolean);
+
+          for (const img of candidates) {
+            const src = cleanUrl(img.currentSrc || img.src || "");
+
+            if (!src) continue;
+            if (src.startsWith("blob:")) continue;
+
+            const isCdn =
+              src.includes("cdninstagram.com") ||
+              src.includes("fbcdn.net") ||
+              src.includes("scontent");
+
+            if (!isCdn) continue;
+
+            return src;
+          }
+        }
+
+        return "";
+      }
+
+      function getAvatarFromJsonNearUsername(username) {
+        const cleanUsername = cleanText(username).replace(/^@/, "");
+
+        if (!cleanUsername) return "";
+
+        const text = getScriptText();
+        const u = escapeRegExp(cleanUsername);
+
+        const patterns = [
+          new RegExp(
+            `"owner"\\s*:\\s*\\{[\\s\\S]{0,2200}?"username"\\s*:\\s*"${u}"[\\s\\S]{0,2200}?"profile_pic_url_hd"\\s*:\\s*"([^"]+)"`,
+            "i"
+          ),
+          new RegExp(
+            `"owner"\\s*:\\s*\\{[\\s\\S]{0,2200}?"username"\\s*:\\s*"${u}"[\\s\\S]{0,2200}?"profile_pic_url"\\s*:\\s*"([^"]+)"`,
+            "i"
+          ),
+          new RegExp(
+            `"user"\\s*:\\s*\\{[\\s\\S]{0,2200}?"username"\\s*:\\s*"${u}"[\\s\\S]{0,2200}?"profile_pic_url_hd"\\s*:\\s*"([^"]+)"`,
+            "i"
+          ),
+          new RegExp(
+            `"user"\\s*:\\s*\\{[\\s\\S]{0,2200}?"username"\\s*:\\s*"${u}"[\\s\\S]{0,2200}?"profile_pic_url"\\s*:\\s*"([^"]+)"`,
+            "i"
+          ),
+          new RegExp(
+            `"username"\\s*:\\s*"${u}"[\\s\\S]{0,2600}?"profile_pic_url_hd"\\s*:\\s*"([^"]+)"`,
+            "i"
+          ),
+          new RegExp(
+            `"username"\\s*:\\s*"${u}"[\\s\\S]{0,2600}?"profile_pic_url"\\s*:\\s*"([^"]+)"`,
+            "i"
+          ),
+          new RegExp(
+            `"profile_pic_url_hd"\\s*:\\s*"([^"]+)"[\\s\\S]{0,2600}?"username"\\s*:\\s*"${u}"`,
+            "i"
+          ),
+          new RegExp(
+            `"profile_pic_url"\\s*:\\s*"([^"]+)"[\\s\\S]{0,2600}?"username"\\s*:\\s*"${u}"`,
+            "i"
+          ),
+        ];
+
+        for (const pattern of patterns) {
+          const match = text.match(pattern);
+
+          if (match && match[1]) {
+            return cleanUrl(match[1]);
+          }
+        }
+
+        return "";
+      }
+
+      const username = cleanText(
+        getUsernameFromJson() || getUsernameFromLinks() || getUsernameFromMeta()
+      ).replace(/^@/, "");
+
+      const fullName = cleanText(getFullNameFromJson() || getFullNameFromMeta());
+
+      const avatarUrl = cleanUrl(
+        getAvatarFromOwnerLink(username) ||
+          getAvatarFromJsonNearUsername(username)
+      );
+
+      return {
+        username,
+        fullName,
+        avatarUrl,
+      };
+    });
+  } catch {
+    return {
+      username: "",
+      fullName: "",
+      avatarUrl: "",
+    };
+  }
+}
+
 function getLogMode(privateMode, noLogin = false) {
   if (noLogin) return "PUBLIC NO-LOGIN";
   if (privateMode) return "PRIVATE COOKIE";
@@ -66,10 +422,11 @@ async function resolveByHtml(page, igUrl, igCookie = "") {
   await page.waitForTimeout(1200);
   await closeInstagramPopups(page);
 
+  let profile = await extractPageProfileInfo(page);
   let media = await extractMediaFromHtml(page, igUrl);
 
   if (media.length > 0) {
-    return media;
+    return attachProfileToMedia(media, profile);
   }
 
   try {
@@ -78,10 +435,11 @@ async function resolveByHtml(page, igUrl, igCookie = "") {
 
   await page.waitForTimeout(700);
 
+  profile = mergeProfile(profile, await extractPageProfileInfo(page));
   media = await extractMediaFromHtml(page, igUrl);
 
   if (media.length > 0) {
-    return media;
+    return attachProfileToMedia(media, profile);
   }
 
   await page.reload({
@@ -92,9 +450,10 @@ async function resolveByHtml(page, igUrl, igCookie = "") {
   await page.waitForTimeout(1500);
   await closeInstagramPopups(page);
 
+  profile = mergeProfile(profile, await extractPageProfileInfo(page));
   media = await extractMediaFromHtml(page, igUrl);
 
-  return media;
+  return attachProfileToMedia(media, profile);
 }
 
 function getMediaPathType(igUrl) {
@@ -115,7 +474,7 @@ function shouldTryPublicNoLogin(normalizedIgUrl, isStory, privateMode) {
 
   const type = getMediaPathType(normalizedIgUrl);
 
-  return type === "reel" || type === "p";
+  return type === "reel" || type === "reels" || type === "p";
 }
 
 function getStoryGroupParamsFromUrl(storyUrl) {
@@ -165,8 +524,9 @@ function getStoryGroupResponseType(media) {
   return media[0].type || "image";
 }
 
-function normalizeStoryGroupItem(item, index) {
+function normalizeStoryGroupItem(item, index, meta = {}) {
   const type = item.type || "image";
+  const profile = normalizeProfile(meta.profile || {});
 
   return {
     id: index + 1,
@@ -176,11 +536,20 @@ function normalizeStoryGroupItem(item, index) {
     width: item.width || null,
     height: item.height || null,
     duration: item.duration || null,
-    downloadUrl: item.downloadUrl,
-    thumbnailUrl:
-      item.thumbnailUrl ||
-      (type === "image" ? item.downloadUrl : null),
-    sourceUrl: item.sourceUrl || null,
+    downloadUrl: cleanUrl(item.downloadUrl),
+    thumbnailUrl: cleanUrl(
+      item.thumbnailUrl || (type === "image" ? item.downloadUrl : "")
+    ),
+    sourceUrl: cleanUrl(item.sourceUrl || meta.sourceUrl || ""),
+    shortcode: cleanText(item.shortcode || meta.mediaKey || ""),
+    username: cleanText(item.username || profile.username),
+    fullName: cleanText(item.fullName || item.full_name || profile.fullName),
+    avatarUrl: cleanUrl(
+      item.avatarUrl ||
+        item.profilePicUrl ||
+        item.profile_pic_url ||
+        profile.avatarUrl
+    ),
     takenAt: item.takenAt || item.taken_at || null,
     mediaType: item.mediaType || item.media_type || null,
   };
@@ -235,17 +604,25 @@ async function extractFirstStoryMedia(igUrl, options = {}) {
     );
   }
 
-  const media = validItems.map((item, index) =>
-    normalizeStoryGroupItem(item, index)
-  );
-
-  const responseType = getStoryGroupResponseType(media);
-
   const mediaKey =
     getInstagramStoryGroupKey(normalizedIgUrl) ||
     getInstagramStoryUsername(normalizedIgUrl) ||
     params.groupId ||
     "story-group";
+
+  const storyProfile = mergeProfile(storyData.profile || {}, getProfileFromItems(rawItems), {
+    username: params.username,
+  });
+
+  const media = validItems.map((item, index) =>
+    normalizeStoryGroupItem(item, index, {
+      sourceUrl: normalizedIgUrl,
+      mediaKey,
+      profile: storyProfile,
+    })
+  );
+
+  const responseType = getStoryGroupResponseType(media);
 
   logResolveOk({
     mode,
@@ -267,30 +644,52 @@ async function extractFirstStoryMedia(igUrl, options = {}) {
     source: igUrl,
     normalizedSource: normalizedIgUrl,
     mediaKey,
+    profile: storyProfile,
     mode: storyData.mode || "story-profile-api",
     media,
   };
 }
 
-function normalizeMediaResult(items) {
+function normalizeMediaResult(items, meta = {}) {
+  const incomingProfile = mergeProfile(
+    meta.profile || {},
+    items?.profile || {},
+    getProfileFromItems(items || [])
+  );
+
+  const sourceUrl = cleanUrl(meta.normalizedSource || meta.source || "");
+  const mediaKey = cleanText(meta.mediaKey || "");
+
   const uniqueItems = [
     ...new Map(
-      items
+      (items || [])
         .filter((item) => item && item.downloadUrl)
-        .map((item) => [item.downloadUrl, item])
+        .map((item) => [cleanUrl(item.downloadUrl), item])
     ).values(),
   ];
 
-  const media = uniqueItems.map((item, i) => ({
-    id: i + 1,
-    type: item.type || "image",
-    width: item.width || null,
-    height: item.height || null,
-    duration: item.duration || null,
-    downloadUrl: item.downloadUrl,
-    thumbnailUrl:
-      item.thumbnailUrl || (item.type === "image" ? item.downloadUrl : null),
-  }));
+  const media = uniqueItems.map((item, i) => {
+    const type = item.type || "image";
+
+    const itemProfile = mergeProfile(item, incomingProfile);
+
+    return {
+      id: i + 1,
+      type,
+      width: item.width || null,
+      height: item.height || null,
+      duration: item.duration || null,
+      downloadUrl: cleanUrl(item.downloadUrl),
+      thumbnailUrl: cleanUrl(
+        item.thumbnailUrl || (type === "image" ? item.downloadUrl : "")
+      ),
+      shortcode: cleanText(item.shortcode || mediaKey),
+      sourceUrl: cleanUrl(item.sourceUrl || sourceUrl),
+      username: itemProfile.username,
+      fullName: itemProfile.fullName,
+      avatarUrl: itemProfile.avatarUrl,
+    };
+  });
 
   const type = media.some((x) => x.type === "video")
     ? media.length > 1
@@ -303,13 +702,14 @@ function normalizeMediaResult(items) {
   return {
     media,
     type,
+    profile: incomingProfile,
   };
 }
 
 function getKindFromPath({ isStory, pathType }) {
   if (isStory) return "STORY_WITH_ID";
   if (pathType === "p") return "POST_PHOTO";
-  if (pathType === "reel") return "REEL";
+  if (pathType === "reel" || pathType === "reels") return "REEL";
   if (pathType === "tv") return "TV";
 
   return "MEDIA";
@@ -352,7 +752,13 @@ async function extractInstagramMedia(igUrl, options = {}) {
 
     try {
       const publicMedia = await resolvePublicMedia(normalizedIgUrl);
-      const normalizedPublic = normalizeMediaResult(publicMedia);
+
+      const normalizedPublic = normalizeMediaResult(publicMedia, {
+        source: igUrl,
+        normalizedSource: normalizedIgUrl,
+        mediaKey,
+        profile: publicMedia?.profile || {},
+      });
 
       if (normalizedPublic.media.length > 0) {
         logResolveOk({
@@ -371,6 +777,7 @@ async function extractInstagramMedia(igUrl, options = {}) {
           source: igUrl,
           normalizedSource: normalizedIgUrl,
           mediaKey,
+          profile: normalizedPublic.profile,
           mode: "public-no-login",
           media: normalizedPublic.media,
         };
@@ -431,7 +838,13 @@ async function extractInstagramMedia(igUrl, options = {}) {
     page = await context.newPage();
 
     const postMedia = await resolveByHtml(page, normalizedIgUrl, igCookie);
-    const normalizedPost = normalizeMediaResult(postMedia);
+
+    const normalizedPost = normalizeMediaResult(postMedia, {
+      source: igUrl,
+      normalizedSource: normalizedIgUrl,
+      mediaKey,
+      profile: postMedia?.profile || {},
+    });
 
     if (normalizedPost.media.length === 0) {
       throw new Error(
@@ -457,6 +870,7 @@ async function extractInstagramMedia(igUrl, options = {}) {
       source: igUrl,
       normalizedSource: normalizedIgUrl,
       mediaKey,
+      profile: normalizedPost.profile,
       mode: privateMode ? "private-client-cookie" : "public-default-session",
       media: normalizedPost.media,
     };
